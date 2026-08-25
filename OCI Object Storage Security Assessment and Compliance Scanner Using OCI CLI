@@ -1,0 +1,532 @@
+#!/bin/bash
+
+# ============================================================
+# OCI Object Storage Security Scanner
+#
+# Purpose:
+#   Read-only security and configuration assessment
+#   for OCI Object Storage buckets.
+#
+# Checks:
+#   - Public access
+#   - Versioning
+#   - Encryption configuration
+#   - Object Events
+#   - Lifecycle policy
+#   - Retention rules
+#   - Replication
+#   - Pre-authenticated requests
+#   - Storage tier
+#   - Approximate object count and size
+#
+# Requirements:
+#   - OCI CLI
+#   - jq
+#   - Valid OCI authentication/configuration
+# ============================================================
+
+
+# ---------------- Configuration ----------------
+
+COMPARTMENT_ID="<COMPARTMENT_OCID>"
+REGION="<OCI_REGION>"
+
+LOG_FILE="/path/to/oci_object_storage_security.log"
+CSV_FILE="/path/to/oci_object_storage_security.csv"
+
+
+# ---------------- Counters ----------------
+
+TOTAL_BUCKETS=0
+SECURITY_ISSUES=0
+WARNING_COUNT=0
+HEALTHY_BUCKETS=0
+ATTENTION_BUCKETS=0
+
+
+# ---------------- Logging ----------------
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
+}
+
+
+# ---------------- Validation ----------------
+
+if [ -z "$COMPARTMENT_ID" ] || \
+   [ "$COMPARTMENT_ID" = "<COMPARTMENT_OCID>" ]; then
+
+    log "ERROR: COMPARTMENT_ID is not configured."
+    exit 1
+fi
+
+
+if [ -z "$REGION" ] || \
+   [ "$REGION" = "<OCI_REGION>" ]; then
+
+    log "ERROR: REGION is not configured."
+    exit 1
+fi
+
+
+# ---------------- Dependency Check ----------------
+
+if ! command -v oci >/dev/null 2>&1; then
+    log "ERROR: OCI CLI is not installed."
+    exit 1
+fi
+
+
+if ! command -v jq >/dev/null 2>&1; then
+    log "ERROR: jq is not installed."
+    exit 1
+fi
+
+
+# ---------------- Header ----------------
+
+log "============================================================"
+log "OCI OBJECT STORAGE SECURITY SCANNER"
+log "============================================================"
+
+log "Compartment : $COMPARTMENT_ID"
+log "Region      : $REGION"
+log "Scan Time   : $(date '+%Y-%m-%d %H:%M:%S')"
+
+log "------------------------------------------------------------"
+
+
+# ---------------- Get Namespace ----------------
+
+NAMESPACE=$(oci os ns get \
+    --region "$REGION" \
+    --query 'data' \
+    --raw-output 2>/dev/null)
+
+
+if [ -z "$NAMESPACE" ]; then
+    log "ERROR: Unable to retrieve Object Storage namespace."
+    exit 1
+fi
+
+
+log "Object Storage Namespace: $NAMESPACE"
+
+log "------------------------------------------------------------"
+
+
+# ---------------- CSV Header ----------------
+
+echo "Bucket,PublicAccess,Versioning,Encryption,ObjectEvents,Lifecycle,Retention,Replication,PARs,StorageTier,Objects,SecurityStatus,Issues" \
+    > "$CSV_FILE"
+
+
+# ---------------- Get Buckets ----------------
+
+BUCKETS=$(oci os bucket list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --namespace-name "$NAMESPACE" \
+    --region "$REGION" \
+    --all \
+    2>&1)
+
+
+if [ $? -ne 0 ]; then
+
+    log "ERROR: Unable to retrieve Object Storage buckets."
+    log "$BUCKETS"
+
+    exit 1
+fi
+
+
+BUCKET_COUNT=$(echo "$BUCKETS" | jq 'length')
+
+
+if [ "$BUCKET_COUNT" -eq 0 ]; then
+
+    log "No Object Storage buckets found."
+
+    log "Overall Security Status: HEALTHY"
+
+    exit 0
+fi
+
+
+log "Total Buckets Found: $BUCKET_COUNT"
+
+log "------------------------------------------------------------"
+
+
+# ============================================================
+# Process Each Bucket
+# ============================================================
+
+while IFS= read -r BUCKET
+do
+
+    TOTAL_BUCKETS=$((TOTAL_BUCKETS + 1))
+
+    BUCKET_NAME=$(echo "$BUCKET" | jq -r '.name')
+
+
+    log ""
+    log "============================================================"
+    log "Scanning Bucket: $BUCKET_NAME"
+    log "============================================================"
+
+
+    # --------------------------------------------------------
+    # Get detailed bucket information
+    # --------------------------------------------------------
+
+    BUCKET_INFO=$(oci os bucket get \
+        --bucket-name "$BUCKET_NAME" \
+        --namespace-name "$NAMESPACE" \
+        --region "$REGION" \
+        --fields approximateCount \
+        --fields approximateSize \
+        2>/dev/null)
+
+
+    if [ $? -ne 0 ]; then
+
+        log "ERROR: Unable to retrieve bucket details."
+        ATTENTION_BUCKETS=$((ATTENTION_BUCKETS + 1))
+
+        continue
+    fi
+
+
+    # --------------------------------------------------------
+    # Basic configuration
+    # --------------------------------------------------------
+
+    PUBLIC_ACCESS=$(echo "$BUCKET_INFO" |
+        jq -r '.data."public-access-type"')
+
+    VERSIONING=$(echo "$BUCKET_INFO" |
+        jq -r '.data.versioning')
+
+    KMS_KEY=$(echo "$BUCKET_INFO" |
+        jq -r '.data."kms-key-id"')
+
+    OBJECT_EVENTS=$(echo "$BUCKET_INFO" |
+        jq -r '.data."object-events-enabled"')
+
+    STORAGE_TIER=$(echo "$BUCKET_INFO" |
+        jq -r '.data."storage-tier"')
+
+    REPLICATION_ENABLED=$(echo "$BUCKET_INFO" |
+        jq -r '.data."replication-enabled"')
+
+    OBJECT_COUNT=$(echo "$BUCKET_INFO" |
+        jq -r '.data."approximate-count"')
+
+    OBJECT_SIZE=$(echo "$BUCKET_INFO" |
+        jq -r '.data."approximate-size"')
+
+
+    log "Public Access       : $PUBLIC_ACCESS"
+    log "Versioning          : $VERSIONING"
+    log "Encryption Key      : $KMS_KEY"
+    log "Object Events       : $OBJECT_EVENTS"
+    log "Storage Tier        : $STORAGE_TIER"
+    log "Replication Enabled : $REPLICATION_ENABLED"
+    log "Approx. Object Count: $OBJECT_COUNT"
+    log "Approx. Object Size : $OBJECT_SIZE"
+
+
+    BUCKET_ISSUES=0
+
+
+    # ========================================================
+    # 1. Public Access Check
+    # ========================================================
+
+    if [ "$PUBLIC_ACCESS" = "NoPublicAccess" ]; then
+
+        log "Public Access Check : PASS"
+
+    else
+
+        log "SECURITY WARNING: Public access is enabled."
+        BUCKET_ISSUES=$((BUCKET_ISSUES + 1))
+        SECURITY_ISSUES=$((SECURITY_ISSUES + 1))
+
+    fi
+
+
+    # ========================================================
+    # 2. Versioning Check
+    # ========================================================
+
+    if [ "$VERSIONING" = "Enabled" ]; then
+
+        log "Versioning Check    : PASS"
+
+    else
+
+        log "Versioning Check    : INFO - Disabled"
+        WARNING_COUNT=$((WARNING_COUNT + 1))
+
+    fi
+
+
+    # ========================================================
+    # 3. Encryption Check
+    # ========================================================
+
+    if [ "$KMS_KEY" = "null" ] || [ -z "$KMS_KEY" ]; then
+
+        log "Encryption          : Oracle-managed key"
+
+    else
+
+        log "Encryption          : Customer-managed KMS key"
+
+    fi
+
+
+    # ========================================================
+    # 4. Object Events Check
+    # ========================================================
+
+    if [ "$OBJECT_EVENTS" = "true" ]; then
+
+        log "Object Events       : ENABLED"
+
+    else
+
+        log "Object Events       : INFO - Disabled"
+
+    fi
+
+
+    # ========================================================
+    # 5. Lifecycle Policy Check
+    # ========================================================
+
+    LIFECYCLE=$(oci os object-lifecycle-policy get \
+        --bucket-name "$BUCKET_NAME" \
+        --namespace-name "$NAMESPACE" \
+        --region "$REGION" \
+        2>/dev/null)
+
+
+    if [ $? -eq 0 ]; then
+
+        LIFECYCLE_COUNT=$(echo "$LIFECYCLE" |
+            jq '.data.items | length')
+
+        if [ "$LIFECYCLE_COUNT" -gt 0 ]; then
+
+            log "Lifecycle Policy    : CONFIGURED ($LIFECYCLE_COUNT rule(s))"
+
+        else
+
+            log "Lifecycle Policy    : NOT CONFIGURED"
+
+        fi
+
+    else
+
+        log "Lifecycle Policy    : NOT CONFIGURED"
+
+    fi
+
+
+    # ========================================================
+    # 6. Retention Rule Check
+    # ========================================================
+
+    RETENTION=$(oci os retention-rule list \
+        --bucket-name "$BUCKET_NAME" \
+        --namespace-name "$NAMESPACE" \
+        --region "$REGION" \
+        --all \
+        2>/dev/null)
+
+
+    if [ $? -eq 0 ]; then
+
+        RETENTION_COUNT=$(echo "$RETENTION" |
+            jq '.data | length')
+
+        if [ "$RETENTION_COUNT" -gt 0 ]; then
+
+            log "Retention Rules     : CONFIGURED ($RETENTION_COUNT)"
+
+        else
+
+            log "Retention Rules     : NOT CONFIGURED"
+
+        fi
+
+    else
+
+        log "Retention Rules     : NOT CONFIGURED"
+
+    fi
+
+
+    # ========================================================
+    # 7. Replication Check
+    # ========================================================
+
+    REPLICATION=$(oci os replication list-replication-policies \
+        --bucket-name "$BUCKET_NAME" \
+        --namespace-name "$NAMESPACE" \
+        --region "$REGION" \
+        --all \
+        2>/dev/null)
+
+
+    if [ $? -eq 0 ]; then
+
+        REPLICATION_COUNT=$(echo "$REPLICATION" |
+            jq '.data | length')
+
+        if [ "$REPLICATION_COUNT" -gt 0 ]; then
+
+            log "Replication         : CONFIGURED ($REPLICATION_COUNT)"
+
+        else
+
+            log "Replication         : NOT CONFIGURED"
+
+        fi
+
+    else
+
+        log "Replication         : NOT CONFIGURED"
+
+    fi
+
+
+    # ========================================================
+    # 8. Pre-Authenticated Request Check
+    # ========================================================
+
+    PAR_DATA=$(oci os preauth-request list \
+        --bucket-name "$BUCKET_NAME" \
+        --namespace-name "$NAMESPACE" \
+        --region "$REGION" \
+        --all \
+        2>/dev/null)
+
+
+    if [ $? -eq 0 ]; then
+
+        PAR_COUNT=$(echo "$PAR_DATA" |
+            jq '.data | length')
+
+        if [ "$PAR_COUNT" -gt 0 ]; then
+
+            log "Pre-Authenticated Requests : $PAR_COUNT"
+
+            log "SECURITY WARNING: Active PAR(s) detected."
+
+            BUCKET_ISSUES=$((BUCKET_ISSUES + 1))
+            SECURITY_ISSUES=$((SECURITY_ISSUES + 1))
+
+        else
+
+            log "Pre-Authenticated Requests : NONE"
+
+        fi
+
+    else
+
+        log "Pre-Authenticated Requests : Unable to determine"
+
+        WARNING_COUNT=$((WARNING_COUNT + 1))
+
+    fi
+
+
+    # ========================================================
+    # Bucket Security Status
+    # ========================================================
+
+    if [ "$BUCKET_ISSUES" -eq 0 ]; then
+
+        BUCKET_STATUS="HEALTHY"
+
+        HEALTHY_BUCKETS=$((HEALTHY_BUCKETS + 1))
+
+    else
+
+        BUCKET_STATUS="ATTENTION_REQUIRED"
+
+        ATTENTION_BUCKETS=$((ATTENTION_BUCKETS + 1))
+
+    fi
+
+
+    log "------------------------------------------------------------"
+    log "Bucket Security Status : $BUCKET_STATUS"
+    log "Security Issues        : $BUCKET_ISSUES"
+    log "------------------------------------------------------------"
+
+
+    # ========================================================
+    # CSV Report
+    # ========================================================
+
+    echo "\"$BUCKET_NAME\",\"$PUBLIC_ACCESS\",\"$VERSIONING\",\"$KMS_KEY\",\"$OBJECT_EVENTS\",\"$LIFECYCLE_COUNT\",\"$RETENTION_COUNT\",\"$REPLICATION_COUNT\",\"$PAR_COUNT\",\"$STORAGE_TIER\",\"$OBJECT_COUNT\",\"$BUCKET_STATUS\",\"$BUCKET_ISSUES\"" \
+        >> "$CSV_FILE"
+
+
+done < <(echo "$BUCKETS" | jq -c '.[]')
+
+
+# ============================================================
+# Final Summary
+# ============================================================
+
+log ""
+log "============================================================"
+log "SECURITY SCAN SUMMARY"
+log "============================================================"
+
+log "Total Buckets Scanned       : $TOTAL_BUCKETS"
+log "Healthy Buckets             : $HEALTHY_BUCKETS"
+log "Buckets Requiring Attention : $ATTENTION_BUCKETS"
+log "Security Issues Found       : $SECURITY_ISSUES"
+log "Informational Warnings      : $WARNING_COUNT"
+
+log "------------------------------------------------------------"
+
+
+if [ "$SECURITY_ISSUES" -gt 0 ]; then
+
+    log "Overall Security Status: ATTENTION REQUIRED"
+
+elif [ "$WARNING_COUNT" -gt 0 ]; then
+
+    log "Overall Security Status: HEALTHY WITH INFORMATIONAL ITEMS"
+
+else
+
+    log "Overall Security Status: HEALTHY"
+
+fi
+
+
+log "CSV Report: $CSV_FILE"
+
+log "============================================================"
+log "OCI Object Storage Security Scan Completed"
+log "============================================================"
+
+
+# ============================================================
+# Exit Code
+# ============================================================
+
+if [ "$SECURITY_ISSUES" -gt 0 ]; then
+    exit 1
+else
+    exit 0
+fi
