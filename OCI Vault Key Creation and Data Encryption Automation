@@ -1,0 +1,464 @@
+#!/bin/bash
+
+# ============================================================
+# OCI Vault Key Creation & Encryption Automation
+#
+# Purpose:
+#   Create an AES-256 Vault key and demonstrate
+#   encryption/decryption using OCI Key Management.
+#
+# Features:
+#   - OCI CLI dependency validation
+#   - Vault configuration validation
+#   - AES-256 key creation
+#   - Key state verification
+#   - Sample data encryption
+#   - Sample data decryption
+#   - Encryption/decryption validation
+#   - Execution logging
+#
+# IMPORTANT:
+#   This script does not store or expose the master key.
+#   OCIDs and environment-specific values are supplied
+#   through configuration variables.
+# ============================================================
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+COMPARTMENT_ID="<COMPARTMENT_OCID>"
+
+REGION="<OCI_REGION>"
+
+VAULT_ID="<VAULT_OCID>"
+
+KEY_NAME="ACE-Demo-AES-Key"
+
+LOG_FILE="./oci_vault_key_operations.log"
+
+PLAINTEXT_FILE="./sample_data.txt"
+
+ENCRYPTED_FILE="./encrypted_data.txt"
+
+DECRYPTED_FILE="./decrypted_data.txt"
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+log() {
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
+
+}
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+log "============================================================"
+
+log "OCI VAULT KEY CREATION & ENCRYPTION AUTOMATION"
+
+log "============================================================"
+
+log "Region     : $REGION"
+
+log "Key Name   : $KEY_NAME"
+
+log "Started At : $(date '+%Y-%m-%d %H:%M:%S')"
+
+log "------------------------------------------------------------"
+
+
+# ============================================================
+# DEPENDENCY CHECK
+# ============================================================
+
+if ! command -v oci >/dev/null 2>&1; then
+
+    log "ERROR: OCI CLI is not installed."
+
+    exit 1
+
+fi
+
+
+# ============================================================
+# CONFIGURATION VALIDATION
+# ============================================================
+
+if [ "$COMPARTMENT_ID" = "<COMPARTMENT_OCID>" ]; then
+
+    log "ERROR: COMPARTMENT_ID is not configured."
+
+    exit 1
+
+fi
+
+
+if [ "$REGION" = "<OCI_REGION>" ]; then
+
+    log "ERROR: REGION is not configured."
+
+    exit 1
+
+fi
+
+
+if [ "$VAULT_ID" = "<VAULT_OCID>" ]; then
+
+    log "ERROR: VAULT_ID is not configured."
+
+    exit 1
+
+fi
+
+
+# ============================================================
+# GET VAULT DETAILS
+# ============================================================
+
+log "Retrieving Vault information..."
+
+VAULT_INFO=$(oci kms management vault get \
+    --vault-id "$VAULT_ID" \
+    --region "$REGION" \
+    2>/dev/null)
+
+
+if [ $? -ne 0 ]; then
+
+    log "ERROR: Unable to retrieve Vault information."
+
+    exit 1
+
+fi
+
+
+MANAGEMENT_ENDPOINT=$(echo "$VAULT_INFO" |
+    jq -r '.data."management-endpoint"')
+
+
+CRYPTO_ENDPOINT=$(echo "$VAULT_INFO" |
+    jq -r '.data."crypto-endpoint"')
+
+
+if [ -z "$MANAGEMENT_ENDPOINT" ] ||
+   [ "$MANAGEMENT_ENDPOINT" = "null" ]; then
+
+    log "ERROR: Management endpoint not found."
+
+    exit 1
+
+fi
+
+
+if [ -z "$CRYPTO_ENDPOINT" ] ||
+   [ "$CRYPTO_ENDPOINT" = "null" ]; then
+
+    log "ERROR: Cryptographic endpoint not found."
+
+    exit 1
+
+fi
+
+
+log "Management Endpoint : $MANAGEMENT_ENDPOINT"
+
+log "Crypto Endpoint     : $CRYPTO_ENDPOINT"
+
+log "------------------------------------------------------------"
+
+
+# ============================================================
+# CREATE KEY SHAPE
+# ============================================================
+
+KEY_SHAPE='{
+    "algorithm": "AES",
+    "length": 32
+}'
+
+
+# ============================================================
+# CREATE AES-256 KEY
+# ============================================================
+
+log "Creating AES-256 Vault key..."
+
+KEY_RESPONSE=$(oci kms management key create \
+    --compartment-id "$COMPARTMENT_ID" \
+    --display-name "$KEY_NAME" \
+    --key-shape "$KEY_SHAPE" \
+    --endpoint "$MANAGEMENT_ENDPOINT" \
+    2>&1)
+
+
+if [ $? -ne 0 ]; then
+
+    log "ERROR: Key creation failed."
+
+    log "$KEY_RESPONSE"
+
+    exit 1
+
+fi
+
+
+KEY_ID=$(echo "$KEY_RESPONSE" |
+    jq -r '.data.id')
+
+
+if [ -z "$KEY_ID" ] ||
+   [ "$KEY_ID" = "null" ]; then
+
+    log "ERROR: Key OCID was not returned."
+
+    exit 1
+
+fi
+
+
+log "Key created successfully."
+
+log "Key OCID: $KEY_ID"
+
+log "------------------------------------------------------------"
+
+
+# ============================================================
+# GET KEY DETAILS
+# ============================================================
+
+log "Retrieving key details..."
+
+KEY_INFO=$(oci kms management key get \
+    --key-id "$KEY_ID" \
+    --endpoint "$MANAGEMENT_ENDPOINT" \
+    2>/dev/null)
+
+
+KEY_STATE=$(echo "$KEY_INFO" |
+    jq -r '.data."lifecycle-state"')
+
+
+KEY_ALGORITHM=$(echo "$KEY_INFO" |
+    jq -r '.data."key-shape"."algorithm"')
+
+
+log "Key State     : $KEY_STATE"
+
+log "Key Algorithm : $KEY_ALGORITHM"
+
+log "------------------------------------------------------------"
+
+
+# ============================================================
+# ENABLE KEY IF REQUIRED
+# ============================================================
+
+if [ "$KEY_STATE" = "CREATING" ]; then
+
+    log "Key is still being created."
+
+    log "Waiting for key to become usable..."
+
+    oci kms management key get \
+        --key-id "$KEY_ID" \
+        --endpoint "$MANAGEMENT_ENDPOINT" \
+        --wait-for-state ENABLED \
+        >/dev/null 2>&1
+
+fi
+
+
+# ============================================================
+# VERIFY KEY STATE
+# ============================================================
+
+KEY_INFO=$(oci kms management key get \
+    --key-id "$KEY_ID" \
+    --endpoint "$MANAGEMENT_ENDPOINT" \
+    2>/dev/null)
+
+
+KEY_STATE=$(echo "$KEY_INFO" |
+    jq -r '.data."lifecycle-state"')
+
+
+log "Current Key State: $KEY_STATE"
+
+
+if [ "$KEY_STATE" != "ENABLED" ]; then
+
+    log "ERROR: Key is not ENABLED."
+
+    exit 1
+
+fi
+
+
+log "Key is ready for cryptographic operations."
+
+log "------------------------------------------------------------"
+
+
+# ============================================================
+# CREATE SAMPLE DATA
+# ============================================================
+
+log "Creating sample plaintext..."
+
+echo "OCI Vault encryption demonstration - ACE Apprentice" \
+    > "$PLAINTEXT_FILE"
+
+
+PLAINTEXT_BASE64=$(base64 -w 0 "$PLAINTEXT_FILE")
+
+
+# ============================================================
+# ENCRYPT DATA
+# ============================================================
+
+log "Encrypting sample data..."
+
+ENCRYPT_RESPONSE=$(oci kms crypto encrypt \
+    --key-id "$KEY_ID" \
+    --plaintext "$PLAINTEXT_BASE64" \
+    --encryption-algorithm AES_256_GCM \
+    --endpoint "$CRYPTO_ENDPOINT" \
+    2>&1)
+
+
+if [ $? -ne 0 ]; then
+
+    log "ERROR: Encryption operation failed."
+
+    log "$ENCRYPT_RESPONSE"
+
+    exit 1
+
+fi
+
+
+CIPHERTEXT=$(echo "$ENCRYPT_RESPONSE" |
+    jq -r '.data.ciphertext')
+
+
+if [ -z "$CIPHERTEXT" ] ||
+   [ "$CIPHERTEXT" = "null" ]; then
+
+    log "ERROR: Ciphertext was not generated."
+
+    exit 1
+
+fi
+
+
+echo "$CIPHERTEXT" > "$ENCRYPTED_FILE"
+
+
+log "Encryption successful."
+
+log "Encrypted output stored in: $ENCRYPTED_FILE"
+
+log "------------------------------------------------------------"
+
+
+# ============================================================
+# DECRYPT DATA
+# ============================================================
+
+log "Decrypting encrypted data..."
+
+DECRYPT_RESPONSE=$(oci kms crypto decrypt \
+    --key-id "$KEY_ID" \
+    --ciphertext "$CIPHERTEXT" \
+    --endpoint "$CRYPTO_ENDPOINT" \
+    2>&1)
+
+
+if [ $? -ne 0 ]; then
+
+    log "ERROR: Decryption operation failed."
+
+    log "$DECRYPT_RESPONSE"
+
+    exit 1
+
+fi
+
+
+DECRYPTED_BASE64=$(echo "$DECRYPT_RESPONSE" |
+    jq -r '.data.plaintext')
+
+
+echo "$DECRYPTED_BASE64" |
+    base64 -d > "$DECRYPTED_FILE"
+
+
+log "Decryption successful."
+
+log "------------------------------------------------------------"
+
+
+# ============================================================
+# VERIFY DATA
+# ============================================================
+
+if cmp -s "$PLAINTEXT_FILE" "$DECRYPTED_FILE"; then
+
+    log "============================================================"
+
+    log "VALIDATION SUCCESS"
+
+    log "============================================================"
+
+    log "Original and decrypted data match."
+
+    log "Encryption/Decryption Test: PASSED"
+
+else
+
+    log "ERROR: Decrypted data does not match original data."
+
+    exit 1
+
+fi
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+log "------------------------------------------------------------"
+
+log "OCI VAULT KEY OPERATION SUMMARY"
+
+log "------------------------------------------------------------"
+
+log "Key Name          : $KEY_NAME"
+
+log "Key Algorithm     : AES-256"
+
+log "Key State         : $KEY_STATE"
+
+log "Encryption        : SUCCESS"
+
+log "Decryption        : SUCCESS"
+
+log "Validation        : PASSED"
+
+log "------------------------------------------------------------"
+
+log "OCI Vault demonstration completed successfully."
+
+log "============================================================"
+
+
+exit 0
