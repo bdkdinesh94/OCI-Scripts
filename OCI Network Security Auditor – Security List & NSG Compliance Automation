@@ -1,0 +1,1439 @@
+#!/bin/bash
+
+# ============================================================
+# OCI Network Security Auditor
+# Security List & Network Security Group Assessment
+#
+# Version: 2.0
+#
+# Purpose:
+#   Perform a READ-ONLY security assessment of OCI Security
+#   Lists and Network Security Groups across a compartment
+#   hierarchy.
+#
+# Features:
+#   - Recursive compartment discovery
+#   - Security List auditing
+#   - NSG auditing
+#   - IPv4 / IPv6 public exposure detection
+#   - TCP / UDP / ICMP protocol decoding
+#   - SSH / RDP / database port detection
+#   - All-port detection
+#   - Wide port-range detection
+#   - Duplicate rule detection
+#   - Risk classification
+#   - Security score
+#   - CSV report
+#   - HTML report
+#   - Detailed log
+#
+# IMPORTANT:
+#   READ-ONLY TOOL
+#   This script does NOT modify, delete or create OCI resources.
+#
+# Requirements:
+#   - OCI CLI
+#   - jq
+#   - Bash 4+
+#
+# ============================================================
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+COMPARTMENT_ID="<COMPARTMENT_OCID>"
+
+REGION="<OCI_REGION>"
+
+OUTPUT_DIR="./oci_network_security_reports"
+
+CSV_FILE="$OUTPUT_DIR/security_audit.csv"
+
+HTML_FILE="$OUTPUT_DIR/security_audit.html"
+
+LOG_FILE="$OUTPUT_DIR/security_audit.log"
+
+WIDE_RANGE_THRESHOLD=100
+
+
+# Sensitive ports
+declare -A SENSITIVE_PORTS
+
+SENSITIVE_PORTS[22]="SSH"
+SENSITIVE_PORTS[3389]="RDP"
+SENSITIVE_PORTS[1521]="Oracle Database"
+SENSITIVE_PORTS[3306]="MySQL"
+SENSITIVE_PORTS[5432]="PostgreSQL"
+SENSITIVE_PORTS[1433]="Microsoft SQL Server"
+SENSITIVE_PORTS[6379]="Redis"
+SENSITIVE_PORTS[27017]="MongoDB"
+
+
+# ============================================================
+# CREATE OUTPUT DIRECTORY
+# ============================================================
+
+mkdir -p "$OUTPUT_DIR"
+
+
+# ============================================================
+# GLOBAL COUNTERS
+# ============================================================
+
+TOTAL_COMPARTMENTS=0
+
+TOTAL_SECURITY_LISTS=0
+TOTAL_NSGS=0
+
+TOTAL_INGRESS=0
+TOTAL_EGRESS=0
+
+CRITICAL_FINDINGS=0
+HIGH_FINDINGS=0
+MEDIUM_FINDINGS=0
+LOW_FINDINGS=0
+
+PUBLIC_RULES=0
+SENSITIVE_PORTS_FOUND=0
+ALL_PORT_RULES=0
+WIDE_RANGES=0
+DUPLICATE_RULES=0
+
+
+# ============================================================
+# SECURITY SCORE
+# ============================================================
+
+SECURITY_SCORE=100
+
+
+# ============================================================
+# LOG FUNCTION
+# ============================================================
+
+log() {
+
+    local MESSAGE="$1"
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $MESSAGE" |
+        tee -a "$LOG_FILE"
+
+}
+
+
+# ============================================================
+# CSV ESCAPE FUNCTION
+# ============================================================
+
+csv_escape() {
+
+    local VALUE="$1"
+
+    VALUE="${VALUE//\"/\"\"}"
+
+    echo "\"$VALUE\""
+
+}
+
+
+# ============================================================
+# PROTOCOL DECODER
+# ============================================================
+
+decode_protocol() {
+
+    case "$1" in
+
+        1)
+            echo "ICMP"
+            ;;
+
+        6)
+            echo "TCP"
+            ;;
+
+        17)
+            echo "UDP"
+            ;;
+
+        all|ALL)
+            echo "ALL"
+            ;;
+
+        *)
+            echo "$1"
+            ;;
+
+    esac
+
+}
+
+
+# ============================================================
+# SCORE CALCULATION
+# ============================================================
+
+apply_score_penalty() {
+
+    case "$1" in
+
+        CRITICAL)
+            SECURITY_SCORE=$((SECURITY_SCORE - 15))
+            ;;
+
+        HIGH)
+            SECURITY_SCORE=$((SECURITY_SCORE - 8))
+            ;;
+
+        MEDIUM)
+            SECURITY_SCORE=$((SECURITY_SCORE - 4))
+            ;;
+
+        LOW)
+            SECURITY_SCORE=$((SECURITY_SCORE - 1))
+            ;;
+
+    esac
+
+
+    if [ "$SECURITY_SCORE" -lt 0 ]; then
+
+        SECURITY_SCORE=0
+
+    fi
+
+}
+
+
+# ============================================================
+# FINDING COUNTER
+# ============================================================
+
+count_severity() {
+
+    case "$1" in
+
+        CRITICAL)
+            CRITICAL_FINDINGS=$((CRITICAL_FINDINGS + 1))
+            ;;
+
+        HIGH)
+            HIGH_FINDINGS=$((HIGH_FINDINGS + 1))
+            ;;
+
+        MEDIUM)
+            MEDIUM_FINDINGS=$((MEDIUM_FINDINGS + 1))
+            ;;
+
+        LOW)
+            LOW_FINDINGS=$((LOW_FINDINGS + 1))
+            ;;
+
+    esac
+
+
+    apply_score_penalty "$1"
+
+}
+
+
+# ============================================================
+# REPORT FINDING
+# ============================================================
+
+report_finding() {
+
+    local RESOURCE_TYPE="$1"
+    local COMPARTMENT_NAME="$2"
+    local RESOURCE_NAME="$3"
+    local RESOURCE_ID="$4"
+    local DIRECTION="$5"
+    local PROTOCOL="$6"
+    local SOURCE_DEST="$7"
+    local PORT_RANGE="$8"
+    local SEVERITY="$9"
+    local FINDING="${10}"
+    local RECOMMENDATION="${11}"
+
+
+    count_severity "$SEVERITY"
+
+
+    log ""
+    log "------------------------------------------------------------"
+    log "SECURITY FINDING"
+    log "------------------------------------------------------------"
+
+    log "Compartment     : $COMPARTMENT_NAME"
+    log "Resource Type   : $RESOURCE_TYPE"
+    log "Resource        : $RESOURCE_NAME"
+    log "Direction       : $DIRECTION"
+    log "Protocol        : $PROTOCOL"
+    log "Source/Dest     : $SOURCE_DEST"
+    log "Port/Range      : $PORT_RANGE"
+    log "Severity        : $SEVERITY"
+    log "Finding         : $FINDING"
+    log "Recommendation   : $RECOMMENDATION"
+
+
+    printf '%s\n' \
+        "$(csv_escape "$RESOURCE_TYPE"),$(csv_escape "$COMPARTMENT_NAME"),$(csv_escape "$RESOURCE_NAME"),$(csv_escape "$RESOURCE_ID"),$(csv_escape "$DIRECTION"),$(csv_escape "$PROTOCOL"),$(csv_escape "$SOURCE_DEST"),$(csv_escape "$PORT_RANGE"),$(csv_escape "$SEVERITY"),$(csv_escape "$FINDING"),$(csv_escape "$RECOMMENDATION")" \
+        >> "$CSV_FILE"
+
+}
+
+
+# ============================================================
+# PORT RANGE EXTRACTION
+# ============================================================
+
+extract_port_range() {
+
+    local RULE="$1"
+
+    local MIN
+    local MAX
+
+
+    MIN=$(echo "$RULE" |
+        jq -r '."tcp-options"."destination-port-range".min // empty')
+
+    MAX=$(echo "$RULE" |
+        jq -r '."tcp-options"."destination-port-range".max // empty')
+
+
+    if [ -n "$MIN" ] && [ -n "$MAX" ]; then
+
+        if [ "$MIN" = "$MAX" ]; then
+
+            echo "$MIN"
+
+        else
+
+            echo "$MIN-$MAX"
+
+        fi
+
+        return
+
+    fi
+
+
+    MIN=$(echo "$RULE" |
+        jq -r '."udp-options"."destination-port-range".min // empty')
+
+    MAX=$(echo "$RULE" |
+        jq -r '."udp-options"."destination-port-range".max // empty')
+
+
+    if [ -n "$MIN" ] && [ -n "$MAX" ]; then
+
+        if [ "$MIN" = "$MAX" ]; then
+
+            echo "$MIN"
+
+        else
+
+            echo "$MIN-$MAX"
+
+        fi
+
+        return
+
+    fi
+
+
+    echo "ALL"
+
+}
+
+
+# ============================================================
+# SOURCE / DESTINATION
+# ============================================================
+
+get_source_destination() {
+
+    local RULE="$1"
+
+    echo "$RULE" |
+        jq -r '.source // .destination // "UNKNOWN"'
+
+}
+
+
+# ============================================================
+# SENSITIVE PORT CHECK
+# ============================================================
+
+check_sensitive_port() {
+
+    local PORT="$1"
+
+    local SOURCE="$2"
+
+    local RESOURCE_TYPE="$3"
+
+    local COMPARTMENT_NAME="$4"
+
+    local RESOURCE_NAME="$5"
+
+    local RESOURCE_ID="$6"
+
+    local DIRECTION="$7"
+
+    local PROTOCOL="$8"
+
+
+    if [[ "$PORT" =~ ^[0-9]+$ ]]; then
+
+        if [[ -n "${SENSITIVE_PORTS[$PORT]}" ]]; then
+
+            SENSITIVE_PORTS_FOUND=$((SENSITIVE_PORTS_FOUND + 1))
+
+
+            local SERVICE="${SENSITIVE_PORTS[$PORT]}"
+
+
+            if [ "$SOURCE" = "0.0.0.0/0" ] ||
+               [ "$SOURCE" = "::/0" ]; then
+
+                report_finding \
+                    "$RESOURCE_TYPE" \
+                    "$COMPARTMENT_NAME" \
+                    "$RESOURCE_NAME" \
+                    "$RESOURCE_ID" \
+                    "$DIRECTION" \
+                    "$PROTOCOL" \
+                    "$SOURCE" \
+                    "$PORT" \
+                    "CRITICAL" \
+                    "$SERVICE port $PORT is publicly accessible." \
+                    "Restrict access to trusted CIDRs, private subnets or approved security groups."
+
+            else
+
+                report_finding \
+                    "$RESOURCE_TYPE" \
+                    "$COMPARTMENT_NAME" \
+                    "$RESOURCE_NAME" \
+                    "$RESOURCE_ID" \
+                    "$DIRECTION" \
+                    "$PROTOCOL" \
+                    "$SOURCE" \
+                    "$PORT" \
+                    "MEDIUM" \
+                    "$SERVICE port $PORT is exposed to a defined network source." \
+                    "Verify that the source network is authorized."
+
+            fi
+
+        fi
+
+    fi
+
+}
+
+
+# ============================================================
+# AUDIT SINGLE RULE
+# ============================================================
+
+audit_rule() {
+
+    local RULE="$1"
+
+    local RESOURCE_TYPE="$2"
+
+    local COMPARTMENT_NAME="$3"
+
+    local RESOURCE_NAME="$4"
+
+    local RESOURCE_ID="$5"
+
+    local DIRECTION="$6"
+
+
+    local PROTOCOL_RAW
+
+    local PROTOCOL
+
+    local SOURCE
+
+    local SOURCE_TYPE
+
+    local PORT_RANGE
+
+
+    PROTOCOL_RAW=$(echo "$RULE" |
+        jq -r '.protocol // "all"')
+
+
+    PROTOCOL=$(decode_protocol "$PROTOCOL_RAW")
+
+
+    SOURCE=$(get_source_destination "$RULE")
+
+
+    SOURCE_TYPE=$(echo "$RULE" |
+        jq -r '."source-type" // "N/A"')
+
+
+    PORT_RANGE=$(extract_port_range "$RULE")
+
+
+    if [ "$DIRECTION" = "INGRESS" ]; then
+
+        TOTAL_INGRESS=$((TOTAL_INGRESS + 1))
+
+    else
+
+        TOTAL_EGRESS=$((TOTAL_EGRESS + 1))
+
+    fi
+
+
+    # ========================================================
+    # PUBLIC SOURCE
+    # ========================================================
+
+    if [ "$SOURCE" = "0.0.0.0/0" ] ||
+       [ "$SOURCE" = "::/0" ]; then
+
+        PUBLIC_RULES=$((PUBLIC_RULES + 1))
+
+    fi
+
+
+    # ========================================================
+    # ALL PORTS
+    # ========================================================
+
+    if [ "$PORT_RANGE" = "ALL" ] &&
+       [ "$DIRECTION" = "INGRESS" ]; then
+
+
+        ALL_PORT_RULES=$((ALL_PORT_RULES + 1))
+
+
+        if [ "$SOURCE" = "0.0.0.0/0" ] ||
+           [ "$SOURCE" = "::/0" ]; then
+
+
+            report_finding \
+                "$RESOURCE_TYPE" \
+                "$COMPARTMENT_NAME" \
+                "$RESOURCE_NAME" \
+                "$RESOURCE_ID" \
+                "$DIRECTION" \
+                "$PROTOCOL" \
+                "$SOURCE" \
+                "ALL" \
+                "CRITICAL" \
+                "All ports are accessible from a public source." \
+                "Remove unrestricted access and permit only required services."
+
+        else
+
+            report_finding \
+                "$RESOURCE_TYPE" \
+                "$COMPARTMENT_NAME" \
+                "$RESOURCE_NAME" \
+                "$RESOURCE_ID" \
+                "$DIRECTION" \
+                "$PROTOCOL" \
+                "$SOURCE" \
+                "ALL" \
+                "HIGH" \
+                "All ports are allowed from a defined source." \
+                "Restrict the rule to required protocols and ports."
+
+        fi
+
+    fi
+
+
+    # ========================================================
+    # PORT RANGE
+    # ========================================================
+
+    if [[ "$PORT_RANGE" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+
+        local MIN="${BASH_REMATCH[1]}"
+
+        local MAX="${BASH_REMATCH[2]}"
+
+        local RANGE_SIZE=$((MAX - MIN + 1))
+
+
+        if [ "$RANGE_SIZE" -ge "$WIDE_RANGE_THRESHOLD" ]; then
+
+            WIDE_RANGES=$((WIDE_RANGES + 1))
+
+
+            if [ "$SOURCE" = "0.0.0.0/0" ] ||
+               [ "$SOURCE" = "::/0" ]; then
+
+                report_finding \
+                    "$RESOURCE_TYPE" \
+                    "$COMPARTMENT_NAME" \
+                    "$RESOURCE_NAME" \
+                    "$RESOURCE_ID" \
+                    "$DIRECTION" \
+                    "$PROTOCOL" \
+                    "$SOURCE" \
+                    "$PORT_RANGE" \
+                    "HIGH" \
+                    "Large port range is publicly accessible." \
+                    "Reduce the range to only the ports required by the workload."
+
+            else
+
+                report_finding \
+                    "$RESOURCE_TYPE" \
+                    "$COMPARTMENT_NAME" \
+                    "$RESOURCE_NAME" \
+                    "$RESOURCE_ID" \
+                    "$DIRECTION" \
+                    "$PROTOCOL" \
+                    "$SOURCE" \
+                    "$PORT_RANGE" \
+                    "MEDIUM" \
+                    "Large port range is permitted." \
+                    "Review and reduce the allowed port range."
+
+            fi
+
+        fi
+
+    fi
+
+
+    # ========================================================
+    # SENSITIVE PORT
+    # ========================================================
+
+    if [ "$DIRECTION" = "INGRESS" ]; then
+
+        check_sensitive_port \
+            "$PORT_RANGE" \
+            "$SOURCE" \
+            "$RESOURCE_TYPE" \
+            "$COMPARTMENT_NAME" \
+            "$RESOURCE_NAME" \
+            "$RESOURCE_ID" \
+            "$DIRECTION" \
+            "$PROTOCOL"
+
+    fi
+
+
+    # ========================================================
+    # PUBLIC NON-SENSITIVE PORT
+    # ========================================================
+
+    if [ "$DIRECTION" = "INGRESS" ] &&
+       [ "$SOURCE" = "0.0.0.0/0" ] ||
+       [ "$SOURCE" = "::/0" ]; then
+
+
+        if [ "$PORT_RANGE" != "ALL" ] &&
+           [[ ! "$PORT_RANGE" =~ ^(22|3389|1521|3306|5432|1433|6379|27017)$ ]]; then
+
+
+            report_finding \
+                "$RESOURCE_TYPE" \
+                "$COMPARTMENT_NAME" \
+                "$RESOURCE_NAME" \
+                "$RESOURCE_ID" \
+                "$DIRECTION" \
+                "$PROTOCOL" \
+                "$SOURCE" \
+                "$PORT_RANGE" \
+                "HIGH" \
+                "Application port is publicly accessible." \
+                "Verify business requirement and restrict access where possible."
+
+        fi
+
+    fi
+
+
+    # ========================================================
+    # OPEN EGRESS
+    # ========================================================
+
+    if [ "$DIRECTION" = "EGRESS" ] &&
+       { [ "$SOURCE" = "0.0.0.0/0" ] ||
+         [ "$SOURCE" = "::/0" ]; }; then
+
+
+        report_finding \
+            "$RESOURCE_TYPE" \
+            "$COMPARTMENT_NAME" \
+            "$RESOURCE_NAME" \
+            "$RESOURCE_ID" \
+            "$DIRECTION" \
+            "$PROTOCOL" \
+            "$SOURCE" \
+            "$PORT_RANGE" \
+            "LOW" \
+            "Unrestricted outbound access is permitted." \
+            "Review whether unrestricted outbound connectivity is required."
+
+    fi
+
+}
+
+
+# ============================================================
+# DUPLICATE RULE DETECTION
+# ============================================================
+
+check_duplicate_rules() {
+
+    local RULES="$1"
+
+    local RESOURCE_TYPE="$2"
+
+    local COMPARTMENT_NAME="$3"
+
+    local RESOURCE_NAME="$4"
+
+    local RESOURCE_ID="$5"
+
+
+    local DUPLICATES
+
+
+    DUPLICATES=$(echo "$RULES" |
+        jq -r '
+        .data[]? |
+        [
+            (.direction // ""),
+            (.protocol // ""),
+            (.source // .destination // ""),
+            (."tcp-options" // {}),
+            (."udp-options" // {})
+        ] |
+        @json
+        ' |
+        sort |
+        uniq -d)
+
+
+    if [ -n "$DUPLICATES" ]; then
+
+        local COUNT
+
+        COUNT=$(echo "$DUPLICATES" | wc -l)
+
+
+        DUPLICATE_RULES=$((DUPLICATE_RULES + COUNT))
+
+
+        report_finding \
+            "$RESOURCE_TYPE" \
+            "$COMPARTMENT_NAME" \
+            "$RESOURCE_NAME" \
+            "$RESOURCE_ID" \
+            "N/A" \
+            "N/A" \
+            "N/A" \
+            "N/A" \
+            "MEDIUM" \
+            "$COUNT duplicate or overlapping network rule pattern(s) detected." \
+            "Review duplicate rules and remove unnecessary entries after validation."
+
+    fi
+
+}
+
+
+# ============================================================
+# SECURITY LIST AUDIT
+# ============================================================
+
+audit_security_lists() {
+
+    local COMPARTMENT_ID="$1"
+
+    local COMPARTMENT_NAME="$2"
+
+
+    log ""
+
+    log "Scanning Security Lists in: $COMPARTMENT_NAME"
+
+
+    local SECURITY_LISTS
+
+
+    SECURITY_LISTS=$(oci network security-list list \
+        --compartment-id "$COMPARTMENT_ID" \
+        --region "$REGION" \
+        --all \
+        2>/dev/null)
+
+
+    if [ $? -ne 0 ]; then
+
+        log "WARNING: Unable to retrieve Security Lists."
+
+        return
+
+    fi
+
+
+    local COUNT
+
+    COUNT=$(echo "$SECURITY_LISTS" |
+        jq '.data | length')
+
+
+    TOTAL_SECURITY_LISTS=$((TOTAL_SECURITY_LISTS + COUNT))
+
+
+    echo "$SECURITY_LISTS" |
+    jq -c '.data[]?' |
+    while read -r SL
+    do
+
+        local NAME
+
+        local ID
+
+
+        NAME=$(echo "$SL" |
+            jq -r '."display-name"')
+
+        ID=$(echo "$SL" |
+            jq -r '.id')
+
+
+        log "Auditing Security List: $NAME"
+
+
+        # ----------------------------------------------------
+        # Ingress
+        # ----------------------------------------------------
+
+        echo "$SL" |
+        jq -c '.["ingress-security-rules"][]?' |
+        while read -r RULE
+        do
+
+            audit_rule \
+                "$RULE" \
+                "Security List" \
+                "$COMPARTMENT_NAME" \
+                "$NAME" \
+                "$ID" \
+                "INGRESS"
+
+        done
+
+
+        # ----------------------------------------------------
+        # Egress
+        # ----------------------------------------------------
+
+        echo "$SL" |
+        jq -c '.["egress-security-rules"][]?' |
+        while read -r RULE
+        do
+
+            audit_rule \
+                "$RULE" \
+                "Security List" \
+                "$COMPARTMENT_NAME" \
+                "$NAME" \
+                "$ID" \
+                "EGRESS"
+
+        done
+
+    done
+
+}
+
+
+# ============================================================
+# NSG AUDIT
+# ============================================================
+
+audit_nsgs() {
+
+    local COMPARTMENT_ID="$1"
+
+    local COMPARTMENT_NAME="$2"
+
+
+    log ""
+
+    log "Scanning Network Security Groups in: $COMPARTMENT_NAME"
+
+
+    local NSGS
+
+
+    NSGS=$(oci network nsg list \
+        --compartment-id "$COMPARTMENT_ID" \
+        --region "$REGION" \
+        --all \
+        2>/dev/null)
+
+
+    if [ $? -ne 0 ]; then
+
+        log "WARNING: Unable to retrieve NSGs."
+
+        return
+
+    fi
+
+
+    local COUNT
+
+    COUNT=$(echo "$NSGS" |
+        jq '.data | length')
+
+
+    TOTAL_NSGS=$((TOTAL_NSGS + COUNT))
+
+
+    echo "$NSGS" |
+    jq -c '.data[]?' |
+    while read -r NSG
+    do
+
+        local NAME
+
+        local ID
+
+
+        NAME=$(echo "$NSG" |
+            jq -r '."display-name"')
+
+        ID=$(echo "$NSG" |
+            jq -r '.id')
+
+
+        log "Auditing NSG: $NAME"
+
+
+        local RULES
+
+
+        RULES=$(oci network nsg rules list \
+            --nsg-id "$ID" \
+            --region "$REGION" \
+            --all \
+            2>/dev/null)
+
+
+        if [ $? -ne 0 ]; then
+
+            log "WARNING: Unable to retrieve rules for $NAME"
+
+            continue
+
+        fi
+
+
+        check_duplicate_rules \
+            "$RULES" \
+            "Network Security Group" \
+            "$COMPARTMENT_NAME" \
+            "$NAME" \
+            "$ID"
+
+
+        echo "$RULES" |
+        jq -c '.data[]?' |
+        while read -r RULE
+        do
+
+            local DIRECTION
+
+
+            DIRECTION=$(echo "$RULE" |
+                jq -r '.direction // "INGRESS"')
+
+
+            audit_rule \
+                "$RULE" \
+                "Network Security Group" \
+                "$COMPARTMENT_NAME" \
+                "$NAME" \
+                "$ID" \
+                "$DIRECTION"
+
+        done
+
+    done
+
+}
+
+
+# ============================================================
+# COMPARTMENT DISCOVERY
+# ============================================================
+
+discover_compartments() {
+
+    log ""
+
+    log "============================================================"
+
+    log "DISCOVERING COMPARTMENT HIERARCHY"
+
+    log "============================================================"
+
+
+    local COMPARTMENTS
+
+
+    COMPARTMENTS=$(oci iam compartment list \
+        --compartment-id-in-subtree true \
+        --access-level ACCESSIBLE \
+        --compartment-id "$COMPARTMENT_ID" \
+        --region "$REGION" \
+        --all \
+        2>/dev/null)
+
+
+    if [ $? -ne 0 ]; then
+
+        log "WARNING: Unable to retrieve child compartments."
+
+        log "Auditing supplied compartment only."
+
+
+        TOTAL_COMPARTMENTS=1
+
+
+        audit_security_lists \
+            "$COMPARTMENT_ID" \
+            "Root/Supplied Compartment"
+
+
+        audit_nsgs \
+            "$COMPARTMENT_ID" \
+            "Root/Supplied Compartment"
+
+
+        return
+
+    fi
+
+
+    # Audit supplied root compartment first
+
+    TOTAL_COMPARTMENTS=$((TOTAL_COMPARTMENTS + 1))
+
+
+    audit_security_lists \
+        "$COMPARTMENT_ID" \
+        "Root/Supplied Compartment"
+
+
+    audit_nsgs \
+        "$COMPARTMENT_ID" \
+        "Root/Supplied Compartment"
+
+
+    # Audit child compartments
+
+    echo "$COMPARTMENTS" |
+    jq -c '.data[]?' |
+    while read -r COMPARTMENT
+    do
+
+        local CHILD_ID
+
+        local CHILD_NAME
+
+        local STATE
+
+
+        CHILD_ID=$(echo "$COMPARTMENT" |
+            jq -r '.id')
+
+        CHILD_NAME=$(echo "$COMPARTMENT" |
+            jq -r '."name"')
+
+        STATE=$(echo "$COMPARTMENT" |
+            jq -r '."lifecycle-state"')
+
+
+        if [ "$CHILD_ID" = "$COMPARTMENT_ID" ]; then
+
+            continue
+
+        fi
+
+
+        if [ "$STATE" != "ACTIVE" ]; then
+
+            continue
+
+        fi
+
+
+        TOTAL_COMPARTMENTS=$((TOTAL_COMPARTMENTS + 1))
+
+
+        audit_security_lists \
+            "$CHILD_ID" \
+            "$CHILD_NAME"
+
+
+        audit_nsgs \
+            "$CHILD_ID" \
+            "$CHILD_NAME"
+
+    done
+
+}
+
+
+# ============================================================
+# HTML REPORT
+# ============================================================
+
+generate_html_report() {
+
+    log ""
+
+    log "Generating HTML security report..."
+
+
+    local STATUS
+
+
+    if [ "$SECURITY_SCORE" -ge 90 ]; then
+
+        STATUS="GOOD"
+
+    elif [ "$SECURITY_SCORE" -ge 75 ]; then
+
+        STATUS="MODERATE"
+
+    elif [ "$SECURITY_SCORE" -ge 50 ]; then
+
+        STATUS="NEEDS IMPROVEMENT"
+
+    else
+
+        STATUS="HIGH RISK"
+
+    fi
+
+
+    cat > "$HTML_FILE" <<EOF
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<title>OCI Network Security Audit</title>
+
+<style>
+
+body {
+    font-family: Arial, sans-serif;
+    margin: 40px;
+}
+
+h1 {
+    margin-bottom: 5px;
+}
+
+.summary {
+    padding: 20px;
+    border: 1px solid #ddd;
+    margin-bottom: 25px;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+
+th, td {
+    border: 1px solid #ddd;
+    padding: 8px;
+    text-align: left;
+}
+
+th {
+    background: #f2f2f2;
+}
+
+.CRITICAL {
+    font-weight: bold;
+}
+
+.HIGH {
+    font-weight: bold;
+}
+
+.MEDIUM {
+    font-weight: bold;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>OCI Network Security Audit Report</h1>
+
+<p>
+Generated: $(date '+%Y-%m-%d %H:%M:%S')
+</p>
+
+<div class="summary">
+
+<h2>Security Summary</h2>
+
+<p><b>Region:</b> $REGION</p>
+
+<p><b>Compartments Scanned:</b> $TOTAL_COMPARTMENTS</p>
+
+<p><b>Security Lists:</b> $TOTAL_SECURITY_LISTS</p>
+
+<p><b>Network Security Groups:</b> $TOTAL_NSGS</p>
+
+<p><b>Ingress Rules:</b> $TOTAL_INGRESS</p>
+
+<p><b>Egress Rules:</b> $TOTAL_EGRESS</p>
+
+<hr>
+
+<p><b>Critical Findings:</b> $CRITICAL_FINDINGS</p>
+
+<p><b>High Findings:</b> $HIGH_FINDINGS</p>
+
+<p><b>Medium Findings:</b> $MEDIUM_FINDINGS</p>
+
+<p><b>Low Findings:</b> $LOW_FINDINGS</p>
+
+<hr>
+
+<h2>Security Score: $SECURITY_SCORE / 100</h2>
+
+<p><b>Status:</b> $STATUS</p>
+
+</div>
+
+
+<h2>Findings</h2>
+
+<table>
+
+<tr>
+
+<th>Resource Type</th>
+
+<th>Compartment</th>
+
+<th>Resource</th>
+
+<th>Direction</th>
+
+<th>Protocol</th>
+
+<th>Source/Destination</th>
+
+<th>Port</th>
+
+<th>Severity</th>
+
+<th>Finding</th>
+
+<th>Recommendation</th>
+
+</tr>
+
+EOF
+
+
+    tail -n +2 "$CSV_FILE" |
+    while IFS=',' read -r TYPE COMPARTMENT NAME ID DIRECTION PROTOCOL SOURCE PORT SEVERITY FINDING RECOMMENDATION
+    do
+
+        cat >> "$HTML_FILE" <<EOF
+
+<tr>
+
+<td>$TYPE</td>
+
+<td>$COMPARTMENT</td>
+
+<td>$NAME</td>
+
+<td>$DIRECTION</td>
+
+<td>$PROTOCOL</td>
+
+<td>$SOURCE</td>
+
+<td>$PORT</td>
+
+<td class="$SEVERITY">$SEVERITY</td>
+
+<td>$FINDING</td>
+
+<td>$RECOMMENDATION</td>
+
+</tr>
+
+EOF
+
+    done
+
+
+    cat >> "$HTML_FILE" <<EOF
+
+</table>
+
+<hr>
+
+<p>
+This report is generated by a read-only OCI security auditing script.
+No OCI resources were modified during the audit.
+</p>
+
+</body>
+
+</html>
+
+EOF
+
+
+    log "HTML report generated: $HTML_FILE"
+
+}
+
+
+# ============================================================
+# CSV HEADER
+# ============================================================
+
+echo "Resource Type,Compartment,Resource Name,Resource OCID,Direction,Protocol,Source/Destination,Port/Range,Severity,Finding,Recommendation" \
+    > "$CSV_FILE"
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "OCI NETWORK SECURITY AUDITOR STARTED"
+
+log "============================================================"
+
+
+discover_compartments
+
+
+generate_html_report
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "FINAL SECURITY AUDIT SUMMARY"
+
+log "============================================================"
+
+log "Compartments Scanned       : $TOTAL_COMPARTMENTS"
+
+log "Security Lists             : $TOTAL_SECURITY_LISTS"
+
+log "Network Security Groups    : $TOTAL_NSGS"
+
+log "Ingress Rules              : $TOTAL_INGRESS"
+
+log "Egress Rules               : $TOTAL_EGRESS"
+
+log "------------------------------------------------------------"
+
+log "Public Rules               : $PUBLIC_RULES"
+
+log "Sensitive Port Findings    : $SENSITIVE_PORTS_FOUND"
+
+log "All-Port Rules             : $ALL_PORT_RULES"
+
+log "Wide Port Ranges           : $WIDE_RANGES"
+
+log "Duplicate Rules            : $DUPLICATE_RULES"
+
+log "------------------------------------------------------------"
+
+log "Critical Findings          : $CRITICAL_FINDINGS"
+
+log "High Findings              : $HIGH_FINDINGS"
+
+log "Medium Findings            : $MEDIUM_FINDINGS"
+
+log "Low Findings               : $LOW_FINDINGS"
+
+log "------------------------------------------------------------"
+
+log "SECURITY SCORE             : $SECURITY_SCORE / 100"
+
+log "------------------------------------------------------------"
+
+log "CSV Report                 : $CSV_FILE"
+
+log "HTML Report                : $HTML_FILE"
+
+log "Log File                   : $LOG_FILE"
+
+log "============================================================"
+
+
+if [ "$SECURITY_SCORE" -ge 90 ]; then
+
+    log "OVERALL STATUS: GOOD"
+
+elif [ "$SECURITY_SCORE" -ge 75 ]; then
+
+    log "OVERALL STATUS: MODERATE"
+
+elif [ "$SECURITY_SCORE" -ge 50 ]; then
+
+    log "OVERALL STATUS: NEEDS IMPROVEMENT"
+
+else
+
+    log "OVERALL STATUS: HIGH RISK"
+
+fi
+
+
+log "============================================================"
+
+log "OCI Network Security Audit Completed."
+
+log "============================================================"
+
+
+exit 0
