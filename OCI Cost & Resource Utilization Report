@@ -1,0 +1,668 @@
+#!/bin/bash
+
+# ============================================================
+# OCI Cost & Resource Utilization Report
+#
+# Read-only OCI cost and utilization assessment
+#
+# Features:
+#   - OCI cost summary
+#   - Service-level cost analysis
+#   - Compute utilization analysis
+#   - Underutilized Compute detection
+#   - CPU utilization reporting
+#   - CSV report generation
+#   - HTML report generation
+#   - Logging
+#
+# Requirements:
+#   - OCI CLI
+#   - jq
+#
+# IMPORTANT:
+#   This script is READ-ONLY.
+#   It does not terminate, resize or modify any OCI resource.
+# ============================================================
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+COMPARTMENT_ID="<COMPARTMENT_OCID>"
+
+REGION="<OCI_REGION>"
+
+OUTPUT_DIR="./oci_cost_utilization_reports"
+
+CSV_FILE="$OUTPUT_DIR/resource_utilization.csv"
+
+COST_FILE="$OUTPUT_DIR/cost_report.json"
+
+HTML_FILE="$OUTPUT_DIR/oci_cost_utilization.html"
+
+LOG_FILE="$OUTPUT_DIR/oci_cost_utilization.log"
+
+# CPU threshold for underutilization
+CPU_THRESHOLD=20
+
+
+# ============================================================
+# CREATE OUTPUT DIRECTORY
+# ============================================================
+
+mkdir -p "$OUTPUT_DIR"
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+log() {
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" |
+        tee -a "$LOG_FILE"
+
+}
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+if [ "$COMPARTMENT_ID" = "<COMPARTMENT_OCID>" ]; then
+
+    log "ERROR: Please configure COMPARTMENT_ID."
+
+    exit 1
+
+fi
+
+
+if [ "$REGION" = "<OCI_REGION>" ]; then
+
+    log "ERROR: Please configure REGION."
+
+    exit 1
+
+fi
+
+
+# ============================================================
+# OCI CLI VALIDATION
+# ============================================================
+
+if ! command -v oci >/dev/null 2>&1; then
+
+    log "ERROR: OCI CLI is not installed."
+
+    exit 1
+
+fi
+
+
+if ! command -v jq >/dev/null 2>&1; then
+
+    log "ERROR: jq is not installed."
+
+    exit 1
+
+fi
+
+
+# ============================================================
+# CSV HEADER
+# ============================================================
+
+echo "Resource Type,Resource Name,Resource OCID,Shape,CPU,Memory GB,State,Compartment,Utilization Status" \
+    > "$CSV_FILE"
+
+
+# ============================================================
+# DATE RANGE
+# ============================================================
+
+END_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+START_DATE=$(date -u -d '30 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
+
+
+# macOS / BSD fallback
+if [ -z "$START_DATE" ]; then
+
+    START_DATE=$(date -u -v-30d '+%Y-%m-%dT%H:%M:%SZ')
+
+fi
+
+
+# ============================================================
+# START
+# ============================================================
+
+log "============================================================"
+
+log "OCI COST & RESOURCE UTILIZATION REPORT"
+
+log "============================================================"
+
+log "Compartment : $COMPARTMENT_ID"
+
+log "Region      : $REGION"
+
+log "Period      : $START_DATE to $END_DATE"
+
+log "============================================================"
+
+
+# ============================================================
+# COST REPORT
+# ============================================================
+
+log "Collecting OCI cost information..."
+
+
+oci usage-api request-summarized-usages \
+    --tenant-id "$COMPARTMENT_ID" \
+    --time-usage-started "$START_DATE" \
+    --time-usage-ended "$END_DATE" \
+    --granularity MONTHLY \
+    --group-by '["service","compartmentName"]' \
+    --region "$REGION" \
+    --all \
+    > "$COST_FILE" 2>/dev/null
+
+
+if [ $? -eq 0 ]; then
+
+    log "Cost data collected successfully."
+
+else
+
+    log "WARNING: Unable to retrieve cost information."
+
+    echo '{}' > "$COST_FILE"
+
+fi
+
+
+# ============================================================
+# COST SUMMARY
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "SERVICE COST SUMMARY"
+
+log "============================================================"
+
+
+if [ -s "$COST_FILE" ]; then
+
+    jq -r '
+    .data.items[]? |
+    [
+        ."service",
+        ."compartment-name",
+        ."computed-amount",
+        ."currency"
+    ] |
+    @tsv
+    ' "$COST_FILE" |
+    while IFS=$'\t' read -r SERVICE COMPARTMENT AMOUNT CURRENCY
+    do
+
+        log "Service: $SERVICE | Compartment: $COMPARTMENT | Cost: $AMOUNT $CURRENCY"
+
+    done
+
+fi
+
+
+# ============================================================
+# COMPUTE RESOURCE DISCOVERY
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "DISCOVERING COMPUTE INSTANCES"
+
+log "============================================================"
+
+
+INSTANCES=$(oci compute instance list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --region "$REGION" \
+    --all \
+    2>/dev/null)
+
+
+if [ $? -ne 0 ]; then
+
+    log "ERROR: Unable to retrieve Compute instances."
+
+    exit 1
+
+fi
+
+
+INSTANCE_COUNT=$(echo "$INSTANCES" |
+    jq '.data | length')
+
+
+log "Total Compute Instances: $INSTANCE_COUNT"
+
+
+# ============================================================
+# RESOURCE COUNTERS
+# ============================================================
+
+TOTAL_CPU=0
+
+TOTAL_MEMORY=0
+
+RUNNING_INSTANCES=0
+
+STOPPED_INSTANCES=0
+
+UNDERUTILIZED=0
+
+
+# ============================================================
+# PROCESS COMPUTE INSTANCES
+# ============================================================
+
+echo "$INSTANCES" |
+jq -c '.data[]?' |
+while read -r INSTANCE
+do
+
+    INSTANCE_NAME=$(echo "$INSTANCE" |
+        jq -r '."display-name"')
+
+    INSTANCE_ID=$(echo "$INSTANCE" |
+        jq -r '.id')
+
+    SHAPE=$(echo "$INSTANCE" |
+        jq -r '.shape')
+
+    STATE=$(echo "$INSTANCE" |
+        jq -r '."lifecycle-state"')
+
+    COMPARTMENT=$(echo "$INSTANCE" |
+        jq -r '."compartment-id"')
+
+
+    # --------------------------------------------------------
+    # FLEX SHAPE CONFIGURATION
+    # --------------------------------------------------------
+
+    CPU=$(echo "$INSTANCE" |
+        jq -r '."shape-config"."ocpus" // 0')
+
+    MEMORY=$(echo "$INSTANCE" |
+        jq -r '."shape-config"."memory-in-gbs" // 0')
+
+
+    TOTAL_CPU=$(echo "$TOTAL_CPU + $CPU" |
+        bc)
+
+    TOTAL_MEMORY=$(echo "$TOTAL_MEMORY + $MEMORY" |
+        bc)
+
+
+    if [ "$STATE" = "RUNNING" ]; then
+
+        RUNNING_INSTANCES=$((RUNNING_INSTANCES + 1))
+
+    fi
+
+
+    if [ "$STATE" = "STOPPED" ]; then
+
+        STOPPED_INSTANCES=$((STOPPED_INSTANCES + 1))
+
+    fi
+
+
+    # --------------------------------------------------------
+    # CPU METRIC QUERY
+    # --------------------------------------------------------
+
+    CPU_UTILIZATION="N/A"
+
+    UTILIZATION_STATUS="UNKNOWN"
+
+
+    if [ "$STATE" = "RUNNING" ]; then
+
+        METRICS=$(oci monitoring metric-data summarize-metrics-data \
+            --compartment-id "$COMPARTMENT" \
+            --namespace "oci_computeagent" \
+            --query-text "CpuUtilization[1d].mean()" \
+            --resource-id "$INSTANCE_ID" \
+            --start-time "$START_DATE" \
+            --end-time "$END_DATE" \
+            --region "$REGION" \
+            2>/dev/null)
+
+
+        if [ $? -eq 0 ]; then
+
+            CPU_UTILIZATION=$(echo "$METRICS" |
+                jq -r '
+                [
+                    .data[].aggregated-datapoints[]?.value
+                ] |
+                if length > 0 then
+                    (add / length)
+                else
+                    "N/A"
+                end
+                ')
+
+
+            if [[ "$CPU_UTILIZATION" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+
+                if (( $(echo "$CPU_UTILIZATION < $CPU_THRESHOLD" | bc -l) )); then
+
+                    UTILIZATION_STATUS="UNDERUTILIZED"
+
+                    UNDERUTILIZED=$((UNDERUTILIZED + 1))
+
+                else
+
+                    UTILIZATION_STATUS="NORMAL"
+
+                fi
+
+            fi
+
+        fi
+
+    fi
+
+
+    # --------------------------------------------------------
+    # LOG
+    # --------------------------------------------------------
+
+    log ""
+
+    log "------------------------------------------------------------"
+
+    log "Instance       : $INSTANCE_NAME"
+
+    log "Shape          : $SHAPE"
+
+    log "CPU/OCPU       : $CPU"
+
+    log "Memory GB      : $MEMORY"
+
+    log "State          : $STATE"
+
+    log "CPU Utilization: $CPU_UTILIZATION"
+
+    log "Status         : $UTILIZATION_STATUS"
+
+
+    if [ "$UTILIZATION_STATUS" = "UNDERUTILIZED" ]; then
+
+        log "RECOMMENDATION: Review instance sizing."
+
+    fi
+
+
+    # --------------------------------------------------------
+    # CSV
+    # --------------------------------------------------------
+
+    echo "\"Compute\",\"$INSTANCE_NAME\",\"$INSTANCE_ID\",\"$SHAPE\",\"$CPU\",\"$MEMORY\",\"$STATE\",\"$COMPARTMENT\",\"$UTILIZATION_STATUS\"" \
+        >> "$CSV_FILE"
+
+
+done
+
+
+# ============================================================
+# STOPPED INSTANCE ANALYSIS
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "STOPPED RESOURCE ANALYSIS"
+
+log "============================================================"
+
+
+if [ "$STOPPED_INSTANCES" -gt 0 ]; then
+
+    log "WARNING: $STOPPED_INSTANCES stopped Compute instance(s) detected."
+
+    log "Review whether these resources are still required."
+
+else
+
+    log "No stopped Compute instances detected."
+
+fi
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "RESOURCE UTILIZATION SUMMARY"
+
+log "============================================================"
+
+log "Total Instances       : $INSTANCE_COUNT"
+
+log "Running Instances     : $RUNNING_INSTANCES"
+
+log "Stopped Instances     : $STOPPED_INSTANCES"
+
+log "Underutilized         : $UNDERUTILIZED"
+
+log "Configured CPU/OCPU   : $TOTAL_CPU"
+
+log "Configured Memory GB  : $TOTAL_MEMORY"
+
+log "============================================================"
+
+
+# ============================================================
+# HTML REPORT
+# ============================================================
+
+log "Generating HTML report..."
+
+
+cat > "$HTML_FILE" <<EOF
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<title>OCI Cost & Resource Utilization Report</title>
+
+<style>
+
+body {
+    font-family: Arial, sans-serif;
+    margin: 40px;
+}
+
+h1 {
+    margin-bottom: 5px;
+}
+
+.summary {
+    border: 1px solid #ddd;
+    padding: 20px;
+    margin-bottom: 30px;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+
+th, td {
+    border: 1px solid #ddd;
+    padding: 8px;
+}
+
+th {
+    background: #f2f2f2;
+}
+
+</style>
+
+</head>
+
+<body>
+
+
+<h1>OCI Cost & Resource Utilization Report</h1>
+
+<p>
+Generated: $(date '+%Y-%m-%d %H:%M:%S')
+</p>
+
+
+<div class="summary">
+
+<h2>Resource Summary</h2>
+
+<p><b>Region:</b> $REGION</p>
+
+<p><b>Instances:</b> $INSTANCE_COUNT</p>
+
+<p><b>Running:</b> $RUNNING_INSTANCES</p>
+
+<p><b>Stopped:</b> $STOPPED_INSTANCES</p>
+
+<p><b>Underutilized:</b> $UNDERUTILIZED</p>
+
+<p><b>Configured CPU/OCPU:</b> $TOTAL_CPU</p>
+
+<p><b>Configured Memory:</b> $TOTAL_MEMORY GB</p>
+
+</div>
+
+
+<h2>Compute Resources</h2>
+
+
+<table>
+
+<tr>
+
+<th>Resource</th>
+
+<th>Shape</th>
+
+<th>CPU</th>
+
+<th>Memory GB</th>
+
+<th>State</th>
+
+<th>Utilization Status</th>
+
+</tr>
+
+EOF
+
+
+tail -n +2 "$CSV_FILE" |
+while IFS=',' read -r TYPE NAME ID SHAPE CPU MEMORY STATE COMPARTMENT STATUS
+do
+
+    cat >> "$HTML_FILE" <<EOF
+
+<tr>
+
+<td>$NAME</td>
+
+<td>$SHAPE</td>
+
+<td>$CPU</td>
+
+<td>$MEMORY</td>
+
+<td>$STATE</td>
+
+<td>$STATUS</td>
+
+</tr>
+
+EOF
+
+done
+
+
+cat >> "$HTML_FILE" <<EOF
+
+</table>
+
+
+<hr>
+
+<p>
+
+This report was generated using OCI CLI in read-only mode.
+No OCI resources were modified.
+
+</p>
+
+
+</body>
+
+</html>
+
+EOF
+
+
+# ============================================================
+# FINAL OUTPUT
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "REPORT GENERATION COMPLETED"
+
+log "============================================================"
+
+log "CSV Report  : $CSV_FILE"
+
+log "Cost JSON   : $COST_FILE"
+
+log "HTML Report : $HTML_FILE"
+
+log "Log File    : $LOG_FILE"
+
+log "============================================================"
+
+log "OCI Cost & Resource Utilization Audit Completed."
+
+log "============================================================"
+
+
+exit 0
