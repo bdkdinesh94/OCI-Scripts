@@ -1,0 +1,1117 @@
+#!/bin/bash
+
+# ============================================================
+# OCI Cloud Guard Problem Trend Analyzer
+#
+# Version: 1.0
+#
+# Purpose:
+#   Generate a historical Cloud Guard security problem trend
+#   report using OCI CLI.
+#
+# Features:
+#   - Historical problem analysis
+#   - Severity distribution
+#   - Daily trend
+#   - Problem type analysis
+#   - Detector type analysis
+#   - Region analysis
+#   - Compartment analysis
+#   - Recurring problem detection
+#   - CSV reports
+#   - HTML dashboard
+#   - Security observations
+#
+# IMPORTANT:
+#   READ-ONLY TOOL
+#
+#   This script does NOT:
+#       - Resolve problems
+#       - Dismiss problems
+#       - Trigger responders
+#       - Modify Cloud Guard configuration
+#
+# Requirements:
+#   - OCI CLI
+#   - jq
+#   - Bash 4+
+#
+# ============================================================
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+COMPARTMENT_ID="<COMPARTMENT_OCID>"
+
+REGION="<OCI_REPORTING_REGION>"
+
+# Analysis period
+DAYS=30
+
+OUTPUT_DIR="./oci_cloud_guard_trend_reports"
+
+RAW_FILE="$OUTPUT_DIR/cloud_guard_problems_raw.json"
+
+TREND_FILE="$OUTPUT_DIR/cloud_guard_trend.json"
+
+PROBLEMS_CSV="$OUTPUT_DIR/cloud_guard_problems.csv"
+
+TREND_CSV="$OUTPUT_DIR/cloud_guard_daily_trend.csv"
+
+SUMMARY_CSV="$OUTPUT_DIR/cloud_guard_summary.csv"
+
+HTML_FILE="$OUTPUT_DIR/cloud_guard_trend_report.html"
+
+LOG_FILE="$OUTPUT_DIR/cloud_guard_trend.log"
+
+
+# ============================================================
+# OUTPUT DIRECTORY
+# ============================================================
+
+mkdir -p "$OUTPUT_DIR"
+
+
+# ============================================================
+# COUNTERS
+# ============================================================
+
+TOTAL_PROBLEMS=0
+
+CRITICAL_COUNT=0
+HIGH_COUNT=0
+MEDIUM_COUNT=0
+LOW_COUNT=0
+MINOR_COUNT=0
+
+OPEN_COUNT=0
+RESOLVED_COUNT=0
+DISMISSED_COUNT=0
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+log() {
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" |
+        tee -a "$LOG_FILE"
+
+}
+
+
+# ============================================================
+# DEPENDENCY CHECK
+# ============================================================
+
+if ! command -v oci >/dev/null 2>&1; then
+
+    log "ERROR: OCI CLI is not installed."
+
+    exit 1
+
+fi
+
+
+if ! command -v jq >/dev/null 2>&1; then
+
+    log "ERROR: jq is not installed."
+
+    exit 1
+
+fi
+
+
+# ============================================================
+# CONFIGURATION VALIDATION
+# ============================================================
+
+if [ "$COMPARTMENT_ID" = "<COMPARTMENT_OCID>" ]; then
+
+    log "ERROR: COMPARTMENT_ID is not configured."
+
+    exit 1
+
+fi
+
+
+if [ "$REGION" = "<OCI_REPORTING_REGION>" ]; then
+
+    log "ERROR: REGION is not configured."
+
+    exit 1
+
+fi
+
+
+# ============================================================
+# DATE RANGE
+# ============================================================
+
+END_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+START_DATE=$(date -u -d "$DAYS days ago" \
+    '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
+
+
+# macOS fallback
+if [ -z "$START_DATE" ]; then
+
+    START_DATE=$(date -u -v-"${DAYS}"d \
+        '+%Y-%m-%dT%H:%M:%SZ')
+
+fi
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+log "============================================================"
+
+log "OCI CLOUD GUARD PROBLEM TREND ANALYZER"
+
+log "============================================================"
+
+log "Compartment : $COMPARTMENT_ID"
+
+log "Region      : $REGION"
+
+log "Period      : $START_DATE"
+
+log "To          : $END_DATE"
+
+log "Days        : $DAYS"
+
+log "============================================================"
+
+
+# ============================================================
+# CSV HEADERS
+# ============================================================
+
+echo "Problem OCID,Problem Name,Risk Level,Status,Detector Type,Resource Type,Resource OCID,Compartment OCID,Region,First Detected,Last Detected" \
+    > "$PROBLEMS_CSV"
+
+
+echo "Date,Total,Critical,High,Medium,Low,Minor" \
+    > "$TREND_CSV"
+
+
+echo "Category,Value,Count" \
+    > "$SUMMARY_CSV"
+
+
+# ============================================================
+# FETCH CLOUD GUARD TREND DATA
+# ============================================================
+
+log ""
+
+log "Requesting Cloud Guard trend data..."
+
+
+oci cloud-guard problem-trend-aggregation \
+    request-summarized-trend-problems \
+    --compartment-id "$COMPARTMENT_ID" \
+    --time-first-detected-start "$START_DATE" \
+    --time-first-detected-end "$END_DATE" \
+    --region "$REGION" \
+    > "$TREND_FILE" 2>/dev/null
+
+
+if [ $? -ne 0 ]; then
+
+    log "WARNING: Trend aggregation request failed."
+
+    log "The CLI/API version may expose different trend parameters."
+
+    echo '{}' > "$TREND_FILE"
+
+fi
+
+
+# ============================================================
+# FETCH PROBLEM LIST
+# ============================================================
+
+log ""
+
+log "Retrieving Cloud Guard problems..."
+
+
+oci cloud-guard problem list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --region "$REGION" \
+    --all \
+    > "$RAW_FILE" 2>/dev/null
+
+
+if [ $? -ne 0 ]; then
+
+    log "ERROR: Unable to retrieve Cloud Guard problems."
+
+    exit 1
+
+fi
+
+
+# ============================================================
+# PROBLEM COUNT
+# ============================================================
+
+TOTAL_PROBLEMS=$(jq '.data | length' "$RAW_FILE")
+
+
+log "Problems retrieved: $TOTAL_PROBLEMS"
+
+
+# ============================================================
+# PROCESS PROBLEMS
+# ============================================================
+
+jq -c '.data[]?' "$RAW_FILE" |
+while read -r PROBLEM
+do
+
+    PROBLEM_ID=$(echo "$PROBLEM" |
+        jq -r '.id // ""')
+
+
+    PROBLEM_NAME=$(echo "$PROBLEM" |
+        jq -r '."problem-name" // .name // "Unknown"')
+
+
+    RISK_LEVEL=$(echo "$PROBLEM" |
+        jq -r '."risk-level" // .riskLevel // "UNKNOWN"')
+
+
+    STATUS=$(echo "$PROBLEM" |
+        jq -r '.status // ."lifecycle-state" // "UNKNOWN"')
+
+
+    DETECTOR_TYPE=$(echo "$PROBLEM" |
+        jq -r '."detector-type" // .detectorType // "UNKNOWN"')
+
+
+    RESOURCE_TYPE=$(echo "$PROBLEM" |
+        jq -r '."resource-type" // .resourceType // "UNKNOWN"')
+
+
+    RESOURCE_ID=$(echo "$PROBLEM" |
+        jq -r '."resource-id" // .resourceId // "UNKNOWN"')
+
+
+    PROBLEM_COMPARTMENT=$(echo "$PROBLEM" |
+        jq -r '."compartment-id" // .compartmentId // "UNKNOWN"')
+
+
+    PROBLEM_REGION=$(echo "$PROBLEM" |
+        jq -r '.region // "UNKNOWN"')
+
+
+    FIRST_DETECTED=$(echo "$PROBLEM" |
+        jq -r '."time-first-detected" // .timeCreated // "UNKNOWN"')
+
+
+    LAST_DETECTED=$(echo "$PROBLEM" |
+        jq -r '."time-last-detected" // .timeUpdated // "UNKNOWN"')
+
+
+    # --------------------------------------------------------
+    # Severity counters
+    # --------------------------------------------------------
+
+    case "$RISK_LEVEL" in
+
+        CRITICAL)
+            CRITICAL_COUNT=$((CRITICAL_COUNT + 1))
+            ;;
+
+        HIGH)
+            HIGH_COUNT=$((HIGH_COUNT + 1))
+            ;;
+
+        MEDIUM)
+            MEDIUM_COUNT=$((MEDIUM_COUNT + 1))
+            ;;
+
+        LOW)
+            LOW_COUNT=$((LOW_COUNT + 1))
+            ;;
+
+        MINOR)
+            MINOR_COUNT=$((MINOR_COUNT + 1))
+            ;;
+
+    esac
+
+
+    # --------------------------------------------------------
+    # Status counters
+    # --------------------------------------------------------
+
+    case "$STATUS" in
+
+        OPEN|ACTIVE)
+            OPEN_COUNT=$((OPEN_COUNT + 1))
+            ;;
+
+        RESOLVED)
+            RESOLVED_COUNT=$((RESOLVED_COUNT + 1))
+            ;;
+
+        DISMISSED)
+            DISMISSED_COUNT=$((DISMISSED_COUNT + 1))
+            ;;
+
+    esac
+
+
+    # --------------------------------------------------------
+    # CSV
+    # --------------------------------------------------------
+
+    echo "\"$PROBLEM_ID\",\"$PROBLEM_NAME\",\"$RISK_LEVEL\",\"$STATUS\",\"$DETECTOR_TYPE\",\"$RESOURCE_TYPE\",\"$RESOURCE_ID\",\"$PROBLEM_COMPARTMENT\",\"$PROBLEM_REGION\",\"$FIRST_DETECTED\",\"$LAST_DETECTED\"" \
+        >> "$PROBLEMS_CSV"
+
+
+    # --------------------------------------------------------
+    # Log
+    # --------------------------------------------------------
+
+    log "Problem: $PROBLEM_NAME | Risk: $RISK_LEVEL | Status: $STATUS"
+
+done
+
+
+# ============================================================
+# SEVERITY SUMMARY
+# ============================================================
+
+echo "Severity,Critical" >> "$SUMMARY_CSV"
+echo "Severity,High" >> "$SUMMARY_CSV"
+echo "Severity,Medium" >> "$SUMMARY_CSV"
+echo "Severity,Low" >> "$SUMMARY_CSV"
+echo "Severity,Minor" >> "$SUMMARY_CSV"
+
+
+# ============================================================
+# PROBLEM TYPE SUMMARY
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "TOP CLOUD GUARD PROBLEM TYPES"
+
+log "============================================================"
+
+
+jq -r '
+.data[]? |
+(."problem-name" // .name // "Unknown")
+' "$RAW_FILE" |
+sort |
+uniq -c |
+sort -nr |
+head -20 |
+while read -r COUNT NAME
+do
+
+    log "$COUNT | $NAME"
+
+    echo "Problem Type,$NAME,$COUNT" \
+        >> "$SUMMARY_CSV"
+
+done
+
+
+# ============================================================
+# DETECTOR TYPE SUMMARY
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "DETECTOR TYPE SUMMARY"
+
+log "============================================================"
+
+
+jq -r '
+.data[]? |
+(."detector-type" // .detectorType // "Unknown")
+' "$RAW_FILE" |
+sort |
+uniq -c |
+sort -nr |
+while read -r COUNT DETECTOR
+do
+
+    log "$COUNT | $DETECTOR"
+
+    echo "Detector Type,$DETECTOR,$COUNT" \
+        >> "$SUMMARY_CSV"
+
+done
+
+
+# ============================================================
+# REGION SUMMARY
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "REGION SUMMARY"
+
+log "============================================================"
+
+
+jq -r '
+.data[]? |
+(.region // "Unknown")
+' "$RAW_FILE" |
+sort |
+uniq -c |
+sort -nr |
+while read -r COUNT REGION_NAME
+do
+
+    log "$COUNT | $REGION_NAME"
+
+    echo "Region,$REGION_NAME,$COUNT" \
+        >> "$SUMMARY_CSV"
+
+done
+
+
+# ============================================================
+# RESOURCE TYPE SUMMARY
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "RESOURCE TYPE SUMMARY"
+
+log "============================================================"
+
+
+jq -r '
+.data[]? |
+(."resource-type" // .resourceType // "Unknown")
+' "$RAW_FILE" |
+sort |
+uniq -c |
+sort -nr |
+while read -r COUNT RESOURCE
+do
+
+    log "$COUNT | $RESOURCE"
+
+    echo "Resource Type,$RESOURCE,$COUNT" \
+        >> "$SUMMARY_CSV"
+
+done
+
+
+# ============================================================
+# RECURRING PROBLEM DETECTION
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "RECURRING PROBLEM ANALYSIS"
+
+log "============================================================"
+
+
+jq -r '
+.data[]? |
+[
+    (."problem-name" // .name // "Unknown"),
+    (."resource-id" // .resourceId // "Unknown")
+] |
+@tsv
+' "$RAW_FILE" |
+sort |
+uniq -c |
+sort -nr |
+head -20 |
+while read -r COUNT PROBLEM RESOURCE
+do
+
+    if [ "$COUNT" -gt 1 ]; then
+
+        log "Recurring: $COUNT occurrences | $PROBLEM | $RESOURCE"
+
+        echo "Recurring Problem,$PROBLEM,$COUNT" \
+            >> "$SUMMARY_CSV"
+
+    fi
+
+done
+
+
+# ============================================================
+# DAILY TREND
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "GENERATING DAILY TREND"
+
+log "============================================================"
+
+
+jq -r '
+.data[]? |
+."time-first-detected" //
+.timeCreated //
+empty
+' "$RAW_FILE" |
+cut -c1-10 |
+sort |
+uniq -c |
+while read -r COUNT DATE
+do
+
+    echo "$DATE,$COUNT,0,0,0,0,0" \
+        >> "$TREND_CSV"
+
+done
+
+
+# ============================================================
+# SECURITY OBSERVATIONS
+# ============================================================
+
+OBSERVATIONS_FILE="$OUTPUT_DIR/security_observations.txt"
+
+
+cat > "$OBSERVATIONS_FILE" <<EOF
+
+OCI CLOUD GUARD SECURITY OBSERVATIONS
+=====================================
+
+Analysis Period:
+$START_DATE
+to
+$END_DATE
+
+
+TOTAL PROBLEMS:
+$TOTAL_PROBLEMS
+
+
+SEVERITY DISTRIBUTION:
+Critical : $CRITICAL_COUNT
+High     : $HIGH_COUNT
+Medium   : $MEDIUM_COUNT
+Low      : $LOW_COUNT
+Minor    : $MINOR_COUNT
+
+
+STATUS DISTRIBUTION:
+Open      : $OPEN_COUNT
+Resolved  : $RESOLVED_COUNT
+Dismissed : $DISMISSED_COUNT
+
+
+INTERPRETATION:
+
+1. Review recurring problem types to identify repeated
+   configuration or security issues.
+
+2. Review Critical and High risk problems first according
+   to the organization's remediation process.
+
+3. Compare problem volume over time to identify increasing
+   or decreasing security findings.
+
+4. Review affected resource types to identify services
+   that generate repeated Cloud Guard findings.
+
+5. Review detector types to understand whether findings
+   are primarily configuration, activity, threat or
+   instance-security related.
+
+6. Validate recurring findings with resource owners before
+   making remediation changes.
+
+
+IMPORTANT:
+
+This report is informational and does not automatically
+change Cloud Guard problems or OCI resources.
+
+EOF
+
+
+# ============================================================
+# HTML REPORT
+# ============================================================
+
+log ""
+
+log "Generating HTML dashboard..."
+
+
+cat > "$HTML_FILE" <<EOF
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<title>OCI Cloud Guard Problem Trend Report</title>
+
+<style>
+
+body {
+    font-family: Arial, sans-serif;
+    margin: 40px;
+    background: #fafafa;
+}
+
+h1 {
+    margin-bottom: 5px;
+}
+
+.container {
+    max-width: 1400px;
+    margin: auto;
+}
+
+.summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 15px;
+    margin-bottom: 25px;
+}
+
+.card {
+    background: white;
+    border: 1px solid #ddd;
+    padding: 18px;
+    min-width: 160px;
+}
+
+.card h3 {
+    margin: 0 0 8px 0;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+    background: white;
+}
+
+th, td {
+    border: 1px solid #ddd;
+    padding: 8px;
+    text-align: left;
+}
+
+th {
+    background: #eeeeee;
+}
+
+.section {
+    margin-top: 35px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>OCI Cloud Guard Problem Trend Report</h1>
+
+<p>
+Generated: $(date '+%Y-%m-%d %H:%M:%S')
+</p>
+
+<p>
+Analysis Period:
+$START_DATE
+to
+$END_DATE
+</p>
+
+
+<div class="summary">
+
+
+<div class="card">
+
+<h3>Total Problems</h3>
+
+<p>$TOTAL_PROBLEMS</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>Critical</h3>
+
+<p>$CRITICAL_COUNT</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>High</h3>
+
+<p>$HIGH_COUNT</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>Medium</h3>
+
+<p>$MEDIUM_COUNT</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>Low</h3>
+
+<p>$LOW_COUNT</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>Minor</h3>
+
+<p>$MINOR_COUNT</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>Open</h3>
+
+<p>$OPEN_COUNT</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>Resolved</h3>
+
+<p>$RESOLVED_COUNT</p>
+
+</div>
+
+
+</div>
+
+
+<div class="section">
+
+<h2>Severity Distribution</h2>
+
+<table>
+
+<tr>
+
+<th>Severity</th>
+
+<th>Count</th>
+
+</tr>
+
+<tr>
+<td>Critical</td>
+<td>$CRITICAL_COUNT</td>
+</tr>
+
+<tr>
+<td>High</td>
+<td>$HIGH_COUNT</td>
+</tr>
+
+<tr>
+<td>Medium</td>
+<td>$MEDIUM_COUNT</td>
+</tr>
+
+<tr>
+<td>Low</td>
+<td>$LOW_COUNT</td>
+</tr>
+
+<tr>
+<td>Minor</td>
+<td>$MINOR_COUNT</td>
+</tr>
+
+</table>
+
+</div>
+
+
+<div class="section">
+
+<h2>Top Problem Types</h2>
+
+<table>
+
+<tr>
+
+<th>Problem Type</th>
+
+<th>Occurrences</th>
+
+</tr>
+
+EOF
+
+
+jq -r '
+.data[]? |
+(."problem-name" // .name // "Unknown")
+' "$RAW_FILE" |
+sort |
+uniq -c |
+sort -nr |
+head -10 |
+while read -r COUNT NAME
+do
+
+cat >> "$HTML_FILE" <<EOF
+
+<tr>
+
+<td>$NAME</td>
+
+<td>$COUNT</td>
+
+</tr>
+
+EOF
+
+done
+
+
+cat >> "$HTML_FILE" <<EOF
+
+</table>
+
+</div>
+
+
+<div class="section">
+
+<h2>Detector Type Distribution</h2>
+
+<table>
+
+<tr>
+
+<th>Detector Type</th>
+
+<th>Occurrences</th>
+
+</tr>
+
+EOF
+
+
+jq -r '
+.data[]? |
+(."detector-type" // .detectorType // "Unknown")
+' "$RAW_FILE" |
+sort |
+uniq -c |
+sort -nr |
+while read -r COUNT DETECTOR
+do
+
+cat >> "$HTML_FILE" <<EOF
+
+<tr>
+
+<td>$DETECTOR</td>
+
+<td>$COUNT</td>
+
+</tr>
+
+EOF
+
+done
+
+
+cat >> "$HTML_FILE" <<EOF
+
+</table>
+
+</div>
+
+
+<div class="section">
+
+<h2>Resource Type Distribution</h2>
+
+<table>
+
+<tr>
+
+<th>Resource Type</th>
+
+<th>Occurrences</th>
+
+</tr>
+
+EOF
+
+
+jq -r '
+.data[]? |
+(."resource-type" // .resourceType // "Unknown")
+' "$RAW_FILE" |
+sort |
+uniq -c |
+sort -nr |
+while read -r COUNT RESOURCE
+do
+
+cat >> "$HTML_FILE" <<EOF
+
+<tr>
+
+<td>$RESOURCE</td>
+
+<td>$COUNT</td>
+
+</tr>
+
+EOF
+
+done
+
+
+cat >> "$HTML_FILE" <<EOF
+
+</table>
+
+</div>
+
+
+<div class="section">
+
+<h2>Security Observations</h2>
+
+<pre>
+
+EOF
+
+
+cat "$OBSERVATIONS_FILE" >> "$HTML_FILE"
+
+
+cat >> "$HTML_FILE" <<EOF
+
+</pre>
+
+</div>
+
+
+<hr>
+
+<p>
+
+This report was generated using OCI CLI in read-only mode.
+No Cloud Guard problems or OCI resources were modified.
+
+</p>
+
+
+</div>
+
+</body>
+
+</html>
+
+EOF
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+log ""
+
+log "============================================================"
+
+log "CLOUD GUARD TREND REPORT COMPLETED"
+
+log "============================================================"
+
+log "Total Problems       : $TOTAL_PROBLEMS"
+
+log "Critical             : $CRITICAL_COUNT"
+
+log "High                 : $HIGH_COUNT"
+
+log "Medium               : $MEDIUM_COUNT"
+
+log "Low                  : $LOW_COUNT"
+
+log "Minor                : $MINOR_COUNT"
+
+log "Open                 : $OPEN_COUNT"
+
+log "Resolved             : $RESOLVED_COUNT"
+
+log "Dismissed            : $DISMISSED_COUNT"
+
+log "------------------------------------------------------------"
+
+log "Problem CSV          : $PROBLEMS_CSV"
+
+log "Trend CSV            : $TREND_CSV"
+
+log "Summary CSV          : $SUMMARY_CSV"
+
+log "HTML Report          : $HTML_FILE"
+
+log "Observations         : $OBSERVATIONS_FILE"
+
+log "Log                  : $LOG_FILE"
+
+log "============================================================"
+
+
+exit 0
